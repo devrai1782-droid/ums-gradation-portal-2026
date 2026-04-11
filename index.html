@@ -82,6 +82,27 @@ async function saveAuditLogCloud(action, detail) {
   });
 }
 
+// ── Check & ensure history_log column exists in ums_gradation ──
+// Agar column nahi hai toh DPI ko SQL message dikhao
+async function _ensureHistoryLogColumn() {
+  const sb = getSupabase();
+  if(!sb) return;
+  try {
+    // Try a test update with history_log column
+    const { error } = await sb.from('ums_gradation').select('history_log').limit(1);
+    if(error && error.message && error.message.includes('history_log')) {
+      // Column missing — show one-time alert to DPI
+      if(window.currentUser === 'DPI') {
+        console.warn('⚠️ history_log column missing in ums_gradation table.');
+        setTimeout(() => {
+          const msg = '⚠️ Supabase Setup Required!\n\nRecord History feature ke liye ek column add karna hoga:\n\nSupabase → SQL Editor mein yeh run karein:\n\nALTER TABLE ums_gradation ADD COLUMN IF NOT EXISTS history_log TEXT;\n\nBaad mein page reload karein.';
+          if(window.currentUser === 'DPI') alert(msg);
+        }, 3000);
+      }
+    }
+  } catch(e) { /* ignore */ }
+}
+
 // ── Load all gradation data from Supabase (paginated — no 1000 row limit) ──
 function _setLoadUI(pct, msg, count) {
   const bar = document.getElementById('dataLoadBar');
@@ -140,9 +161,51 @@ async function loadDataFromSupabase() {
       const obj = {};
       for(let i=1; i<=32; i++) obj['field'+i] = row['field'+i] || '';
       obj._sbId = row.id;
+      // field25 normalize — empty/unknown → default 'NO'
+      var f25v = (obj.field25||'').toString().trim().toUpperCase();
+      if(f25v === 'YES') obj.field25 = 'YES';
+      else obj.field25 = 'NO';
       // Restore _changedFields for highlight display
+      // Meta fields (29=Status, 30=UpdatedBy, 31=Doc) ko remove karo — yeh hamesha change hote hain
       if(row.changed_fields){
-        try { obj._changedFields = JSON.parse(row.changed_fields); } catch(e) {}
+        try {
+          var cf = JSON.parse(row.changed_fields);
+          // Remove meta field highlights
+          [29, 30, 31].forEach(function(k){ delete cf[k]; delete cf[String(k)]; });
+          // District fields (23=field24, 27=field28): DEO prefix difference → same
+          [23, 27].forEach(function(k){
+            var ks = String(k);
+            var entry = cf[k] || cf[ks];
+            if(entry){
+              var fromN = (entry.from||'').toUpperCase().replace(/^DEO\s+/,'').replace(/^JD\s+/,'').trim();
+              var toN   = (entry.to  ||'').toUpperCase().replace(/^DEO\s+/,'').replace(/^JD\s+/,'').trim();
+              if(fromN === toN){ delete cf[k]; delete cf[ks]; }
+            }
+          });
+          // Date fields: NIL / '' / format difference → same
+          var DATE_CI_ARR = [6, 13, 15, 16, 17, 18, 19];
+          function _normDL(v){
+            if(!v) return '';
+            v = String(v).trim();
+            if(!v||v==='NIL'||v==='NIL/NIL/NIL'||v==='0'||v==='NO') return '';
+            if(/^\d{4}-\d{2}-\d{2}$/.test(v)) return v;
+            var m=v.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})$/);
+            if(m) return m[3]+'-'+m[2].padStart(2,'0')+'-'+m[1].padStart(2,'0');
+            return v;
+          }
+          DATE_CI_ARR.forEach(function(k){
+            var ks = String(k);
+            var entry = cf[k] || cf[ks];
+            if(entry){
+              if(_normDL(entry.from) === _normDL(entry.to)){ delete cf[k]; delete cf[ks]; }
+            }
+          });
+          if(Object.keys(cf).length > 0) obj._changedFields = cf;
+        } catch(e) {}
+      }
+      // Restore history_log so Record History works after reload
+      if(row.history_log){
+        try { obj.history_log = JSON.parse(row.history_log); } catch(e) {}
       }
       return obj;
     });
@@ -200,6 +263,10 @@ async function saveRecordToSupabase(record) {
   for(let i=1; i<=32; i++) row['field'+i] = record['field'+i] || '';
   // Save _changedFields as JSON for highlight persistence
   row['changed_fields'] = record._changedFields ? JSON.stringify(record._changedFields) : null;
+  // Save history_log as JSON so it persists across reloads
+  row['history_log'] = record.history_log && record.history_log.length
+    ? JSON.stringify(record.history_log)
+    : null;
   if(record._sbId) {
     // Update existing row
     const { error } = await sb.from('ums_gradation').update(row).eq('id', record._sbId);
@@ -568,6 +635,8 @@ tr.soft-deleted:hover td {
 
     <!-- 📋 HISTORY -->
     <button class="btn" style="background:#009688;color:white;" onclick="viewHistorySmart()">📋 HISTORY</button>
+
+
 
     <!-- ↺ RESET FILTERS -->
     <button id="clearFiltersBtn" class="btn" style="background:#ff4d4d;color:white;">↺ RESET FILTERS</button>
@@ -1724,11 +1793,18 @@ function saveEntry(isNew) {
     window.fullData.push(row);
     // Also add to filteredData so it shows immediately even if filter is active
     window.filteredData.push(row);
+    // Render immediately so new row shows with Gradation No. right away
+    renderVirtual();
+    // Scroll to new row
+    setTimeout(function(){
+      const container = document.getElementById('tableContainer');
+      if(container) container.scrollTop = container.scrollHeight;
+    }, 100);
     auditLog('NEW ADD','Added: '+row.field3+' — '+row.field4);
     if(typeof broadcastDataUpdate==='function') broadcastDataUpdate(`${_realtimeDistrict()} added a new record: ${row.field3} — ${row.field4}`, 'update');
     saveAndSync(row).then(ok => {
-      // Re-render after _sbId is set from Supabase insert
       renderVirtual();
+      _addToRecent(row);
       myAlert(ok ? '✅ Record saved successfully.\n\n'+row.field4+' ('+row.field3+')' : '⚠️ Record saved locally, but Supabase sync failed.');
     });
     currentDocData=null;
@@ -1827,19 +1903,57 @@ function handleUpdateClick() {
   updated._doc  = window.fullData[idx]._doc;    // preserve existing document
 
   // ── Merge _changedFields (highlight tracking) ──
+  // ci 29=Status, 30=UpdatedBy, 31=DocName — yeh meta fields hain, SKIP karo
+  // warna har update pe automatically highlight ho jaate hain (timestamp change)
+  var SKIP_HIGHLIGHT_CI = new Set([29, 30, 31]);
+
+  // Date normalize: alag formats ko yyyy-mm-dd mein convert karo comparison ke liye
+  // NIL / '' / 'NIL/NIL/NIL' — sab ko empty string maano (no date)
+  function _normDateCmp(v) {
+    if(!v) return '';
+    v = String(v).trim();
+    if(!v || v === 'NIL' || v === 'NIL/NIL/NIL' || v === '0' || v === 'NO') return '';
+    if(/^\d{4}-\d{2}-\d{2}$/.test(v)) return v;
+    var m = v.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})$/);
+    if(m) return m[3]+'-'+m[2].padStart(2,'0')+'-'+m[1].padStart(2,'0');
+    return v;
+  }
+
+  // District normalize: "DEO BHOPAL" aur "BHOPAL" ko same maano
+  // ci=23 = field24 (Present Posting District), ci=27 = field28 (Higher Post District)
+  var DISTRICT_CI = new Set([23, 27]);
+  function _normDistrict(v) {
+    if(!v) return '';
+    return String(v).trim().toUpperCase().replace(/^DEO\s+/,'').replace(/^JD\s+/,'').trim();
+  }
+
   var prevChanged = oldRecord._changedFields || {};
   var changedSet = Object.assign({}, prevChanged);
   for(var ci=0; ci<colConfig.length; ci++){
+    if(SKIP_HIGHLIGHT_CI.has(ci)) continue;
     var fk='field'+(ci+1);
-    var ov=(oldRecord[fk]||'').toString().trim();
-    var nv=(updated[fk]||'').toString().trim();
+    var ov, nv;
+    if(DATE_COLS.has(ci)){
+      ov = _normDateCmp(oldRecord[fk]);
+      nv = _normDateCmp(updated[fk]);
+    } else if(DISTRICT_CI.has(ci)){
+      ov = _normDistrict(oldRecord[fk]);
+      nv = _normDistrict(updated[fk]);
+    } else {
+      ov = (oldRecord[fk]||'').toString().trim();
+      nv = (updated[fk]||'').toString().trim();
+    }
     if(ov!==nv){
-      var originalFrom = prevChanged[ci] ? prevChanged[ci].from : ov;
-      if(originalFrom === nv){ delete changedSet[ci]; }
-      else { changedSet[ci] = { from: originalFrom, to: nv }; }
+      var originalFrom = prevChanged[ci] ? prevChanged[ci].from : (oldRecord[fk]||'').toString().trim();
+      var originalFromNorm = DATE_COLS.has(ci) ? _normDateCmp(originalFrom) : DISTRICT_CI.has(ci) ? _normDistrict(originalFrom) : originalFrom.trim();
+      if(originalFromNorm === nv){ delete changedSet[ci]; }
+      else { changedSet[ci] = { from: originalFrom, to: (updated[fk]||'').toString().trim() }; }
+    } else {
+      // Same value — agar pehle se incorrectly highlight tha toh remove
+      if(changedSet[ci] !== undefined) delete changedSet[ci];
     }
   }
-  updated._changedFields = changedSet;
+  updated._changedFields = Object.keys(changedSet).length > 0 ? changedSet : undefined;
 
   // ── Save history_log per record (MS Gradation style) ──
   // Skip status/updatedBy/docName fields (30,31,32) from history diff
@@ -1871,7 +1985,8 @@ function handleUpdateClick() {
 }
 
 function buildRowFromForm(isNew, now) {
-  const n=window.fullData.length+1;
+  // S.No. = current count + 1 for new, preserve existing for update
+  const n = isNew ? window.fullData.length + 1 : null;
   const mode19=document.getElementById('in19mode').value;
   const transfer=mode19==='NIL'?'NIL':document.getElementById('in19').value;
   const p2mode=document.getElementById('in16bMode')?document.getElementById('in16bMode').value:'DATE';
@@ -1887,6 +2002,7 @@ function buildRowFromForm(isNew, now) {
   }
 
   // Auto-assign gradation number for new entries
+  // NOTE: Calculate BEFORE push — fullData still has old records at this point
   let autoGradNo = '';
   if(isNew) {
     const allGradNos = (window.fullData || [])
@@ -1894,10 +2010,14 @@ function buildRowFromForm(isNew, now) {
       .filter(v => !isNaN(v) && v > 0);
     const maxGrad = allGradNos.length > 0 ? Math.max(...allGradNos) : 0;
     autoGradNo = String(maxGrad + 1);
+    // Safety: agar kisi wajah se blank aa jaye
+    if(!autoGradNo || autoGradNo === '0' || autoGradNo === 'NaN') {
+      autoGradNo = String((window.fullData.length || 0) + 1);
+    }
   }
 
   return {
-    field1: String(n),
+    field1: isNew ? String(n) : (window.fullData.find(r=>r.field3===document.getElementById('in3').value)||{}).field1 || String(window.fullData.length),
     field2: isNew ? autoGradNo : (document.getElementById('in2').value||''),
     field3: document.getElementById('in3').value,
     field4: document.getElementById('in4').value,
@@ -2045,14 +2165,15 @@ function performSearch() {
     sel.appendChild(newOpt);
     sel.value=val;
   })();
-  document.getElementById('in23').value=rec.field25||''; handleUPPLogic();
-  document.getElementById('in24').value=rec.field26||'';
-  document.getElementById('in25').value=rec.field27||'';
+  // Field 25 — उच्च पद ज्वाइन (YES/NO)
+  // Step 1: pehle in24/in25/in26 ki values set karo (fields still disabled)
+  document.getElementById('in24').value = rec.field26||'';
+  document.getElementById('in25').value = rec.field27||'';
   // Higher Post District — case-insensitive match
   (function(){
     const sel = document.getElementById('in26');
     const val = (rec.field28||'').trim();
-    if(!val){ sel.value=''; return; }
+    if(!val){ sel.selectedIndex=0; return; }
     if(Array.from(sel.options).some(o=>o.value===val)){ sel.value=val; return; }
     const opt = Array.from(sel.options).find(o=>o.value.toUpperCase()===val.toUpperCase());
     if(opt){ sel.value=opt.value; return; }
@@ -2060,6 +2181,24 @@ function performSearch() {
     if(opt2){ sel.value=opt2.value; return; }
     const newOpt=document.createElement('option'); newOpt.value=val; newOpt.textContent=val;
     sel.appendChild(newOpt); sel.value=val;
+  })();
+  // Step 2: ab in23 set karo aur handleUPPLogic call karo
+  // field25 empty = purana data jisme YES/NO store nahi tha → default 'NO'
+  (function(){
+    var v = (rec.field25||'').toString().trim().toUpperCase();
+    if(v !== 'YES') v = 'NO';
+    var sel23 = document.getElementById('in23');
+    sel23.value = v;
+    var f24 = document.getElementById('in24');
+    var f25 = document.getElementById('in25');
+    var f26 = document.getElementById('in26');
+    if(v === 'YES'){
+      f24.readOnly=false; f25.readOnly=false; f26.disabled=false;
+      [f24,f25,f26].forEach(function(el){el.style.pointerEvents='auto';el.style.background='#fff';el.style.cursor='';});
+    } else {
+      f24.readOnly=true; f25.readOnly=true; f26.disabled=true;
+      [f24,f25,f26].forEach(function(el){el.style.pointerEvents='none';el.style.background='#bdc3c7';el.style.cursor='not-allowed';});
+    }
   })();
   document.getElementById('in27').value=rec.field29||'NO';
   document.getElementById('inUpdatedBy').value=rec.field31||'';
@@ -2071,6 +2210,18 @@ function performSearch() {
   }
 
   autoDesignationLogic();
+  // autoDesignationLogic ke baad in24/25/26 values phir se ensure karo (koi reset na ho)
+  (function(){
+    var v = (rec.field25||'').toString().trim().toUpperCase();
+    if(v !== 'YES') v = 'NO';
+    if(v === 'YES'){
+      var f24=document.getElementById('in24'), f25=document.getElementById('in25'), f26=document.getElementById('in26');
+      if(!f24.value) f24.value = rec.field26||'';
+      if(!f25.value) f25.value = rec.field27||'';
+      f24.readOnly=false; f25.readOnly=false; f26.disabled=false;
+      [f24,f25,f26].forEach(function(el){el.style.pointerEvents='auto';el.style.background='#fff';el.style.cursor='';});
+    }
+  })();
   document.getElementById('newAddBtn').disabled=true;
   document.getElementById('newAddBtn').style.opacity='.45';
   document.getElementById('updateBtn').style.display='inline-block';
@@ -2078,6 +2229,7 @@ function performSearch() {
   document.getElementById('formStatusBadge').textContent='EDIT MODE';
   document.getElementById('formStatusBadge').style.background='#e65100';
   highlightRow(rec.field3);
+  _addToRecent(rec);
 }
 
 function highlightRow(uid) {
@@ -2245,6 +2397,11 @@ function _buildRow(row, i, data_len) {
     td.title = String(fieldVal);
     if(ci===0){
       td.textContent = i+1;
+    } else if(ci===1){
+      // Gradation No. — agar blank hai toh S.No. se fill karo (temporary until Supabase save)
+      const gradNo = row.field2 || '';
+      td.textContent = gradNo || (i+1);
+      if(!gradNo) td.style.color = '#bbb'; // dimmed to show it's auto-filled
     } else if(ci===29){
       const st=row.field30||'';
       const badgeCls = st==='Deleted' ? 'badge-deleted' : st.includes('New') ? 'badge-new' : 'badge-updated';
@@ -2266,12 +2423,26 @@ function _buildRow(row, i, data_len) {
       var rawVal = fieldVal;
       if((ci===15||ci===16) && !rawVal) rawVal='NIL';
       var dv = fmtDate(rawVal);
-      if(row._changedFields && row._changedFields[ci]!==undefined){
-        td.innerHTML = buildChangedHTML(row._changedFields[ci].from||'', dv);
+      // Only highlight if from !== to (after date normalization)
+      var cf = row._changedFields && row._changedFields[ci];
+      if(cf !== undefined && cf !== null){
+        var fromFmt = fmtDate(cf.from||'');
+        // Agar from aur to same hain toh highlight mat karo
+        if(fromFmt !== dv && cf.from !== dv){
+          td.innerHTML = buildChangedHTML(cf.from||'', dv);
+        } else {
+          td.textContent = dv;
+        }
       } else { td.textContent = dv; }
     } else {
-      if(row._changedFields && row._changedFields[ci]!==undefined){
-        td.innerHTML = buildChangedHTML(row._changedFields[ci].from||'', fieldVal);
+      var cf2 = row._changedFields && row._changedFields[ci];
+      if(cf2 !== undefined && cf2 !== null){
+        // Agar from aur current value same hain toh highlight mat karo
+        if(cf2.from !== fieldVal){
+          td.innerHTML = buildChangedHTML(cf2.from||'', fieldVal);
+        } else {
+          td.textContent = fieldVal;
+        }
       } else { td.textContent = fieldVal; }
     }
     tr.appendChild(td);
@@ -2390,9 +2561,61 @@ function viewDocument(doc) {
   if(!doc||!doc.data){ myAlert('❌ Document is not available.'); return; }
   const win=window.open('','_blank');
   if(doc.data.startsWith('data:image')){
-    win.document.write(`<html><body style="margin:0;background:#000;display:flex;align-items:center;justify-content:center;min-height:100vh;"><img src="${doc.data}" style="max-width:100%;max-height:100vh;"></body></html>`);
+    win.document.write(`<html><body style="margin:0;background:#000;display:flex;align-items:center;justify-content:center;min-height:100vh;"><img src="${doc.data}" style="max-width:100%;max-height:100vh;">
+<!-- ═══ RECENT RECORDS MODAL ═══ -->
+<div id="recentRecordsModal" style="display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.55);z-index:9000;align-items:center;justify-content:center;">
+  <div style="background:#fff;border-radius:12px;width:420px;max-width:95vw;box-shadow:0 10px 40px rgba(0,0,0,0.35);overflow:hidden;">
+    <!-- Header -->
+    <div style="background:linear-gradient(135deg,#7c3aed,#5b21b6);color:white;padding:14px 18px;display:flex;align-items:center;justify-content:space-between;">
+      <div style="display:flex;align-items:center;gap:8px;">
+        <span style="font-size:18px;">🕒</span>
+        <span style="font-weight:700;font-size:14px;letter-spacing:.3px;">Recent Records</span>
+      </div>
+      <div style="display:flex;align-items:center;gap:10px;">
+        <span style="font-size:10px;opacity:.75;">Last 15 searched/edited</span>
+        <button onclick="closeRecentRecords()" style="background:rgba(255,255,255,0.2);border:none;color:white;width:26px;height:26px;border-radius:50%;cursor:pointer;font-size:16px;font-weight:bold;line-height:1;">×</button>
+      </div>
+    </div>
+    <!-- List -->
+    <div id="recentRecordsList" style="max-height:420px;overflow-y:auto;padding:8px 0;">
+      <div style="text-align:center;color:#999;padding:32px 0;font-size:13px;">No recent records yet.<br><span style="font-size:11px;">Search karo ya form kholne se records yahan dikhenge.</span></div>
+    </div>
+    <!-- Footer -->
+    <div style="padding:10px 16px;border-top:1px solid #eee;display:flex;justify-content:space-between;align-items:center;">
+      <button onclick="clearRecentRecords()" style="background:none;border:1px solid #ddd;color:#888;padding:5px 12px;border-radius:4px;cursor:pointer;font-size:11px;font-weight:600;">🗑 Clear History</button>
+      <button onclick="closeRecentRecords()" style="background:#7c3aed;color:white;border:none;padding:6px 18px;border-radius:4px;cursor:pointer;font-size:12px;font-weight:700;">Close</button>
+    </div>
+  </div>
+</div>
+</body></html>`);
   } else {
-    win.document.write(`<html><body style="margin:0;height:100vh;"><embed src="${doc.data}" type="application/pdf" width="100%" height="100%"></body></html>`);
+    win.document.write(`<html><body style="margin:0;height:100vh;"><embed src="${doc.data}" type="application/pdf" width="100%" height="100%">
+<!-- ═══ RECENT RECORDS MODAL ═══ -->
+<div id="recentRecordsModal" style="display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.55);z-index:9000;align-items:center;justify-content:center;">
+  <div style="background:#fff;border-radius:12px;width:420px;max-width:95vw;box-shadow:0 10px 40px rgba(0,0,0,0.35);overflow:hidden;">
+    <!-- Header -->
+    <div style="background:linear-gradient(135deg,#7c3aed,#5b21b6);color:white;padding:14px 18px;display:flex;align-items:center;justify-content:space-between;">
+      <div style="display:flex;align-items:center;gap:8px;">
+        <span style="font-size:18px;">🕒</span>
+        <span style="font-weight:700;font-size:14px;letter-spacing:.3px;">Recent Records</span>
+      </div>
+      <div style="display:flex;align-items:center;gap:10px;">
+        <span style="font-size:10px;opacity:.75;">Last 15 searched/edited</span>
+        <button onclick="closeRecentRecords()" style="background:rgba(255,255,255,0.2);border:none;color:white;width:26px;height:26px;border-radius:50%;cursor:pointer;font-size:16px;font-weight:bold;line-height:1;">×</button>
+      </div>
+    </div>
+    <!-- List -->
+    <div id="recentRecordsList" style="max-height:420px;overflow-y:auto;padding:8px 0;">
+      <div style="text-align:center;color:#999;padding:32px 0;font-size:13px;">No recent records yet.<br><span style="font-size:11px;">Search karo ya form kholne se records yahan dikhenge.</span></div>
+    </div>
+    <!-- Footer -->
+    <div style="padding:10px 16px;border-top:1px solid #eee;display:flex;justify-content:space-between;align-items:center;">
+      <button onclick="clearRecentRecords()" style="background:none;border:1px solid #ddd;color:#888;padding:5px 12px;border-radius:4px;cursor:pointer;font-size:11px;font-weight:600;">🗑 Clear History</button>
+      <button onclick="closeRecentRecords()" style="background:#7c3aed;color:white;border:none;padding:6px 18px;border-radius:4px;cursor:pointer;font-size:12px;font-weight:700;">Close</button>
+    </div>
+  </div>
+</div>
+</body></html>`);
   }
   win.document.title=doc.name||'Document';
 }
@@ -3304,6 +3527,8 @@ checkLogin = function() {
       } else {
         if(storageBadge) storageBadge.innerHTML = '⚠️ No records found in Supabase.';
       }
+      // Check if history_log column exists (one-time DPI alert if missing)
+      _ensureHistoryLogColumn();
     });
   } else {
     let att=(window._loginAttempts[ak]||0)+1;
@@ -3588,43 +3813,7 @@ function showShortcutsHelp() {
   setTimeout(()=>document.addEventListener('click',function _c(){ div.remove(); document.removeEventListener('click',_c); }),100);
 }
 
-// ─── RECENT RECORDS ───
-window.recentRecords = [];
-
-function addToRecent(uid, name, dist) {
-  if(!uid) return;
-  window.recentRecords=window.recentRecords.filter(r=>r.id!==uid);
-  window.recentRecords.unshift({id:uid,name:name||'—',district:dist||'—',time:new Date().toLocaleTimeString('en-IN')});
-  if(window.recentRecords.length>10) window.recentRecords=window.recentRecords.slice(0,10);
-  // recentRecords in-memory only
-  if(document.getElementById('recentPanel')&&document.getElementById('recentPanel').style.display!=='none') renderRecentList();
-}
-
-function renderRecentList() {
-  const list=document.getElementById('recentList'); if(!list) return;
-  if(!window.recentRecords.length){ list.innerHTML='<div style="color:#aaa;font-size:11px;text-align:center;padding:15px;">No records viewed yet</div>'; return; }
-  list.innerHTML=window.recentRecords.map(r=>`<div onclick="jumpToRecord('${r.id}')" style="padding:7px 10px;border-bottom:1px solid #f0f0f0;cursor:pointer;" onmouseover="this.style.background='#e3f2fd'" onmouseout="this.style.background='white'"><div style="font-size:12px;font-weight:bold;color:#002e5b;">#${r.id} &nbsp; ${r.name}</div><div style="font-size:10px;color:#888;">📍 ${r.district} &nbsp;|&nbsp; 🕐 ${r.time}</div></div>`).join('');
-}
-
-function jumpToRecord(uid) {
-  const sb=document.getElementById('searchVal'); if(sb){ sb.value=uid; performSearch(); }
-  toggleRecentPanel();
-}
-
-function toggleRecentPanel() {
-  let panel=document.getElementById('recentPanel');
-  if(!panel){
-    panel=document.createElement('div'); panel.id='recentPanel';
-    panel.style.cssText='position:fixed;top:50px;right:20px;z-index:8000;background:white;border:1px solid #ddd;border-radius:8px;box-shadow:0 6px 20px rgba(0,0,0,.2);width:280px;overflow:hidden;';
-    panel.innerHTML=`<div style="background:#002e5b;color:white;padding:10px 14px;display:flex;justify-content:space-between;align-items:center;"><span style="font-weight:700;font-size:13px;">🕐 Recent Records</span><button onclick="toggleRecentPanel()" style="background:none;border:none;color:white;font-size:16px;cursor:pointer;">×</button></div><div id="recentList" style="max-height:300px;overflow-y:auto;"></div>`;
-    document.body.appendChild(panel);
-    renderRecentList();
-  } else {
-    const isOpen=panel.style.display!=='none';
-    panel.style.display=isOpen?'none':'block';
-    if(!isOpen) renderRecentList();
-  }
-}
+// Recent Records: See bottom of file (MS-style floating panel)
 
 // Smart history: if a row is selected open its record history, else open audit log
 function viewHistorySmart() {
@@ -3909,15 +4098,20 @@ function initRealtime() {
     // ── Broadcast: data changed by someone else ──
     .on('broadcast', { event: 'data-update' }, ({ payload }) => {
       if(payload.user !== me) {
-        showNotification(payload.msg || 'Data has been updated by another user.', payload.type || 'update');
+        showNotification((payload.msg || 'Data has been updated by another user.') + ' (refreshing...)', payload.type || 'update');
         const formOpen = document.getElementById('formOverlay')?.style.display === 'block';
-        const editingRow = selectedRowElement !== null;
-        if(!formOpen && !editingRow) {
-          // Silent background refresh
-          // Just re-render to show any local changes
-          renderVirtual();
+        if(!formOpen) {
+          // Supabase se fresh data reload karo — real-time sync
+          loadDataFromSupabase().then(ok => {
+            if(ok) {
+              window.filteredData = [...window.fullData];
+              renderVirtual();
+              updateStorageBadge(true);
+            }
+          });
         } else {
-          // Bell disabled
+          // Form open hai — sirf badge update karo, reload form band hone ke baad karo
+          showNotification('⚠️ Doosre user ne data update kiya. Form band karke refresh kar lena.', 'info');
         }
       }
     })
@@ -4197,7 +4391,10 @@ async function processPasteData() {
     const cols = validLines[i];
     const obj={};
     for(let j=0;j<32;j++) obj['field'+(j+1)] = (cols[j]||'').trim();
-    obj['field1'] = String(i+1); // correct serial number
+    obj['field1'] = String(i+1);
+    // field25 normalize — empty/unknown → default 'NO'
+    var _f25 = (obj.field25||'').toString().trim().toUpperCase();
+    obj.field25 = (_f25 === 'YES') ? 'YES' : 'NO';
     newRows.push(obj);
     if(i%200===0 || i===validLines.length-1){
       const pct = Math.round(10 + (i/validLines.length)*50);
@@ -4267,6 +4464,91 @@ async function processPasteData() {
   resultMsg.innerHTML=`<span style="color:#2e7d32;font-size:13px;font-weight:bold;">✅ ${newRows.length} records loaded successfully!</span>`;
   setTimeout(()=>{ closePasteModal(); }, 2500);
 }
+
+// ============================================================
+// ⚡ RECENT RECORDS — MS Style (floating button + side panel)
+// ============================================================
+window.recentRecords = JSON.parse(localStorage.getItem('ux_recentRecords') || '[]');
+
+function addToRecent(uniqueId, name, district) {
+    if (!uniqueId) return;
+    window.recentRecords = window.recentRecords.filter(r => r.id !== uniqueId);
+    window.recentRecords.unshift({ id: uniqueId, name: name || '—', district: district || '—', time: new Date().toLocaleTimeString('en-IN') });
+    if (window.recentRecords.length > 10) window.recentRecords = window.recentRecords.slice(0, 10);
+    localStorage.setItem('ux_recentRecords', JSON.stringify(window.recentRecords));
+    if (document.getElementById('recentPanel') && document.getElementById('recentPanel').style.display !== 'none') {
+        renderRecentList();
+    }
+}
+
+// Alias for UMS internal calls (_addToRecent)
+function _addToRecent(rec) {
+    if (!rec) return;
+    var uid = rec.field3 || rec.uniqueId || '';
+    var name = rec.field4 || '—';
+    var dist = rec.field24 || rec.field22 || '—';
+    addToRecent(uid, name, dist);
+}
+
+function renderRecentList() {
+    const list = document.getElementById('recentList');
+    if (!list) return;
+    if (window.recentRecords.length === 0) {
+        list.innerHTML = '<div style="color:#aaa;font-size:11px;text-align:center;padding:15px;">No records viewed yet</div>';
+        return;
+    }
+    list.innerHTML = window.recentRecords.map((r, i) => `
+        <div onclick="jumpToRecord('${r.id}')" style="padding:7px 10px;border-bottom:1px solid #f0f0f0;cursor:pointer;transition:background 0.15s;"
+             onmouseover="this.style.background='#e3f2fd'" onmouseout="this.style.background='white'">
+            <div style="font-size:12px;font-weight:bold;color:#002e5b;">#${r.id} &nbsp; ${r.name}</div>
+            <div style="font-size:10px;color:#888;">📍 ${r.district} &nbsp;|&nbsp; 🕐 ${r.time}</div>
+        </div>`).join('');
+}
+
+function jumpToRecord(uniqueId) {
+    const searchBox = document.getElementById('searchVal');
+    if (searchBox) { searchBox.value = uniqueId; performSearch(); }
+    closeRecentPanel();
+}
+
+function toggleRecentPanel() {
+    const panel = document.getElementById('recentPanel');
+    if (!panel) return;
+    const isOpen = panel.style.display !== 'none';
+    panel.style.display = isOpen ? 'none' : 'block';
+    if (!isOpen) renderRecentList();
+}
+
+function closeRecentPanel() {
+    const panel = document.getElementById('recentPanel');
+    if (panel) panel.style.display = 'none';
+}
+
+// Inject floating button + panel on DOMContentLoaded
+document.addEventListener('DOMContentLoaded', function() {
+    const recentBtn = document.createElement('div');
+    recentBtn.id = 'recentBtn';
+    recentBtn.onclick = toggleRecentPanel;
+    recentBtn.title = 'Recent Records (Ctrl+R)';
+    recentBtn.style.cssText = 'position:fixed;bottom:20px;right:20px;background:#002e5b;color:white;width:48px;height:48px;border-radius:50%;display:flex;align-items:center;justify-content:center;cursor:pointer;font-size:20px;z-index:9990;box-shadow:0 4px 12px rgba(0,0,0,0.3);transition:transform 0.2s;';
+    recentBtn.innerHTML = '🕐';
+    recentBtn.onmouseover = () => recentBtn.style.transform = 'scale(1.1)';
+    recentBtn.onmouseout  = () => recentBtn.style.transform = 'scale(1)';
+    document.body.appendChild(recentBtn);
+
+    const recentPanel = document.createElement('div');
+    recentPanel.id = 'recentPanel';
+    recentPanel.style.cssText = 'display:none;position:fixed;bottom:78px;right:20px;width:300px;max-height:380px;background:white;border-radius:10px;box-shadow:0 8px 25px rgba(0,0,0,0.3);z-index:9989;overflow:hidden;font-family:sans-serif;';
+    recentPanel.innerHTML = `
+        <div style="background:#002e5b;color:white;padding:10px 14px;display:flex;justify-content:space-between;align-items:center;">
+            <b style="font-size:13px;">🕐 Recent Records</b>
+            <button onclick="closeRecentPanel()" style="background:rgba(255,255,255,0.2);border:none;color:white;width:22px;height:22px;border-radius:50%;cursor:pointer;font-size:12px;">✕</button>
+        </div>
+        <div id="recentList" style="overflow-y:auto;max-height:320px;"></div>`;
+    document.body.appendChild(recentPanel);
+});
+
 </script>
+
 </body>
 </html>
