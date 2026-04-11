@@ -494,7 +494,7 @@ tr.soft-deleted:hover td {
     </div>
     <button onclick="checkLogin()" style="width:100%;padding:12px;background:#0d47a1;color:white;border:none;border-radius:4px;font-weight:bold;cursor:pointer;font-size:14px;letter-spacing:.5px;">ACCESS SYSTEM</button>
     <div id="loginError" style="color:red;font-size:11px;margin-top:10px;font-weight:bold;min-height:16px;"></div>
-    <p style="color:#bdc3c7;font-size:.75em;text-align:center;margin-top:14px;">Developed by: <strong>DPI MP</strong> | © 2026 UMS Gradation ERP</p>
+    <p style="color:#bdc3c7;font-size:.75em;text-align:center;margin-top:14px;">Developed by: <strong>Lakshya Rai</strong> | © 2026 UMS Gradation ERP</p>
   </div>
   <p style="margin-top:18px;font-size:11px;opacity:.7;">State Education Portal — UMS Gradation Module 2026</p>
 </div>
@@ -1987,16 +1987,16 @@ function performSearch() {
   document.getElementById('in4').value=rec.field4;
   document.getElementById('in5').value=rec.field5;
   document.getElementById('in6').value=rec.field6;
-  document.getElementById('in7').value=rec.field7; onDobChange();
+  document.getElementById('in7').value=toInputDate(rec.field7); onDobChange();
   document.getElementById('in8').value=rec.field8;
   document.getElementById('in9').value=rec.field9;
   setMSValues(10, rec.field10);
   setMSValues(11, rec.field11);
   setMSValues(12, rec.field12);
   document.getElementById('in13').value=rec.field13;
-  document.getElementById('in14').value=rec.field14;
+  document.getElementById('in14').value=toInputDate(rec.field14);
   document.getElementById('in15').value=rec.field15;
-  document.getElementById('in16').value=rec.field16;
+  document.getElementById('in16').value=toInputDate(rec.field16==='NIL'?'':rec.field16);
 
   // 2nd Promotion (field17)
   const p2val=rec.field17||'';
@@ -2006,26 +2006,61 @@ function performSearch() {
     handlePromo2Mode();
   } else {
     if(document.getElementById('in16bMode')) document.getElementById('in16bMode').value='DATE';
-    document.getElementById('in16b').value=p2val;
+    document.getElementById('in16b').value=toInputDate(p2val);
     if(document.getElementById('in16b').disabled){ document.getElementById('in16b').disabled=false; document.getElementById('in16b').style.background=''; }
   }
 
-  document.getElementById('in17').value=fmtDate(rec.field18||'');  // Present Cadre Date
-  document.getElementById('in18').value=fmtDate(rec.field19||'');  // Seniority Date
+  // Present Cadre Date & Seniority (read-only display fields — show formatted)
+  const raw18 = toInputDate(rec.field18||'');
+  document.getElementById('in17').value = fmtDate(raw18||rec.field18||'');
+  document.getElementById('in17').dataset.raw = raw18;
+  const raw19 = toInputDate(rec.field19||'');
+  document.getElementById('in18').value = fmtDate(raw19||rec.field19||'');
+  document.getElementById('in18').dataset.raw = raw19;
 
   // Transfer Date (field20)
-  if(rec.field20==='NIL'){ document.getElementById('in19mode').value='NIL'; document.getElementById('in19').value=''; }
-  else { document.getElementById('in19mode').value='DATE'; document.getElementById('in19').value=rec.field20||''; }
+  if(rec.field20==='NIL'||!rec.field20){ document.getElementById('in19mode').value='NIL'; document.getElementById('in19').value=''; }
+  else { document.getElementById('in19mode').value='DATE'; document.getElementById('in19').value=toInputDate(rec.field20)||rec.field20; }
   handleTransferMode();
   document.getElementById('in19detail').value=rec.field21||'';
 
   document.getElementById('in20').value=rec.field22||'';
   document.getElementById('in21').value=rec.field23||'';
-  document.getElementById('in22').value=rec.field24||'';
+  // Present Posting District — case-insensitive match
+  (function(){
+    const sel = document.getElementById('in22');
+    const val = (rec.field24||'').trim();
+    if(!val){ sel.value=''; return; }
+    // Try exact match first
+    if(Array.from(sel.options).some(o=>o.value===val)){ sel.value=val; return; }
+    // Try case-insensitive match
+    const opt = Array.from(sel.options).find(o=>o.value.toUpperCase()===val.toUpperCase());
+    if(opt){ sel.value=opt.value; return; }
+    // Try partial match (e.g. "BHOPAL" matches "DEO BHOPAL")
+    const opt2 = Array.from(sel.options).find(o=>o.value.toUpperCase().includes(val.toUpperCase())||val.toUpperCase().includes(o.value.toUpperCase()));
+    if(opt2){ sel.value=opt2.value; return; }
+    // Not found — add as temporary option
+    const newOpt = document.createElement('option');
+    newOpt.value=val; newOpt.textContent=val;
+    sel.appendChild(newOpt);
+    sel.value=val;
+  })();
   document.getElementById('in23').value=rec.field25||''; handleUPPLogic();
   document.getElementById('in24').value=rec.field26||'';
   document.getElementById('in25').value=rec.field27||'';
-  document.getElementById('in26').value=rec.field28||'';
+  // Higher Post District — case-insensitive match
+  (function(){
+    const sel = document.getElementById('in26');
+    const val = (rec.field28||'').trim();
+    if(!val){ sel.value=''; return; }
+    if(Array.from(sel.options).some(o=>o.value===val)){ sel.value=val; return; }
+    const opt = Array.from(sel.options).find(o=>o.value.toUpperCase()===val.toUpperCase());
+    if(opt){ sel.value=opt.value; return; }
+    const opt2 = Array.from(sel.options).find(o=>o.value.toUpperCase().includes(val.toUpperCase())||val.toUpperCase().includes(o.value.toUpperCase()));
+    if(opt2){ sel.value=opt2.value; return; }
+    const newOpt=document.createElement('option'); newOpt.value=val; newOpt.textContent=val;
+    sel.appendChild(newOpt); sel.value=val;
+  })();
   document.getElementById('in27').value=rec.field29||'NO';
   document.getElementById('inUpdatedBy').value=rec.field31||'';
 
@@ -2120,12 +2155,28 @@ function clearForm() {
   handleUPPLogic();
 }
 
-// ─── DATE FORMAT HELPER (YYYY-MM-DD → dd-mm-yyyy) ───
+// ─── DATE FORMAT HELPER (YYYY-MM-DD → dd/mm/yyyy for display) ───
 function fmtDate(val) {
   if (!val || val === 'NIL' || val === 'NO') return val || '';
   const p = String(val).split('-');
   if (p.length === 3 && p[0].length === 4) return p[2] + '/' + p[1] + '/' + p[0]; // dd/mm/yyyy
   return val;
+}
+
+// ─── UNIVERSAL DATE → yyyy-mm-dd (for HTML date input) ───
+// Handles: yyyy-mm-dd, dd-mm-yyyy, dd/mm/yyyy, dd.mm.yyyy
+function toInputDate(val) {
+  if (!val || val === 'NIL' || val === 'NO' || val === 'NIL/NIL/NIL') return '';
+  const s = String(val).trim();
+  // Already yyyy-mm-dd
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return s;
+  // dd-mm-yyyy or dd/mm/yyyy or dd.mm.yyyy
+  const m = s.match(/^(\d{1,2})[-\/\.](\d{1,2})[-\/\.](\d{4})$/);
+  if (m) return m[3] + '-' + m[2].padStart(2,'0') + '-' + m[1].padStart(2,'0');
+  // yyyy/mm/dd
+  const m2 = s.match(/^(\d{4})\/(\d{2})\/(\d{2})$/);
+  if (m2) return m2[1] + '-' + m2[2] + '-' + m2[3];
+  return '';
 }
 // HTML escape helper
 function escHtml(str){ return String(str).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
