@@ -542,7 +542,7 @@ tr.soft-deleted:hover td {
 
 
 <!-- ═══ LOGIN OVERLAY ═══ -->
-<div id="loginOverlay" style="position:fixed;top:0;left:0;width:100%;height:100%;background:#1a237e;z-index:9999;display:flex;align-items:center;justify-content:center;flex-direction:column;color:white;">
+<div id="loginOverlay" style="position:fixed;top:0;left:0;width:100%;height:100%;background:#1a237e;z-index:1000010;display:flex;align-items:center;justify-content:center;flex-direction:column;color:white;">
   <div style="background:white;padding:30px;border-radius:8px;width:360px;box-shadow:0 10px 25px rgba(0,0,0,.5);color:#333;text-align:center;">
     <div style="font-size:42px;margin-bottom:8px;">🎓</div>
     <h2 style="margin:0 0 4px 0;color:#1a237e;font-size:18px;">UMS GRADATION ERP LOGIN</h2>
@@ -1287,10 +1287,25 @@ function saveTimeLimit() {
   const s=document.getElementById('dpiStartDate').value, e=document.getElementById('dpiEndDate').value;
   if(!s||!e){myAlert('Please select both start and end dates.');return;}
   window._umsStart=s; window._umsEnd=e;
+  localStorage.setItem('ums_config_start', s);
+  localStorage.setItem('ums_config_end', e);
   updateDeadlineBadge();
   myAlert('✅ Access period updated successfully.'); toggleDPI(); checkLockStatus();
 }
 function checkLockStatus() {
+  // ✅ RULE 1: DPI hamesha exempt — kabhi lock nahi hoga
+  const cu = window.currentUser || currentUser || null;
+  if (cu === 'DPI') {
+    document.getElementById('lockScreen').style.display = 'none';
+    return;
+  }
+  // ✅ RULE 2: Koi logged in nahi hai to lockScreen mat dikhao
+  // (loginOverlay pehle se access control kar raha hai)
+  if (!cu) {
+    document.getElementById('lockScreen').style.display = 'none';
+    return;
+  }
+  // ✅ RULE 3: Sirf JD aur DEO ke liye date check karo
   const s=window._umsStart, e=window._umsEnd;
   if(!s||!e) return;
   const now=new Date(), today=now.getFullYear()+'-'+String(now.getMonth()+1).padStart(2,'0')+'-'+String(now.getDate()).padStart(2,'0');
@@ -1346,6 +1361,8 @@ function checkLogin() {
     const deo = DEO_DISTRICT[user];
     if(deo){ document.getElementById('in22').value=deo; document.getElementById('in22').disabled=true; }
     auditLog('LOGIN','User logged in');
+    // ✅ Date lock check: DPI ke liye bypass, JD/DEO ke liye apply
+    if(typeof checkLockStatus === 'function') checkLockStatus();
   } else {
     let att=(window._loginAttempts[ak]||0)+1;
     window._loginAttempts[ak]=att;
@@ -1399,6 +1416,11 @@ function updateStorageBadge(ok) {
 
 // ─── INIT ───
 window.onload = function() {
+  // ✅ localStorage se dates load karo (page refresh ke baad bhi dates rahein)
+  const _savedStart = localStorage.getItem('ums_config_start');
+  const _savedEnd   = localStorage.getItem('ums_config_end');
+  if(_savedStart) window._umsStart = _savedStart;
+  if(_savedEnd)   window._umsEnd   = _savedEnd;
   checkLockStatus();
   updateDeadlineBadge();
   buildTableHead();
@@ -3508,6 +3530,8 @@ checkLogin = function() {
     auditLog('LOGIN','User logged in');
     // ── REALTIME: Join collaboration channel after login ──
     if(typeof initRealtime === 'function') initRealtime();
+    // ✅ Date lock check: DPI ke liye bypass, JD/DEO ke liye apply
+    if(typeof checkLockStatus === 'function') checkLockStatus();
     // ── Supabase se data load karo (progress bar ke saath) ──
     const storageBadge = document.getElementById('storageBadge');
     if(storageBadge) storageBadge.innerHTML = '⏳ Loading data from Supabase...';
