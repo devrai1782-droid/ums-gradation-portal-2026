@@ -30,31 +30,77 @@ function getSupabase() {
 // ── Summary document upload — Supabase Storage ──
 async function summaryUploadDocCloud(officeKey, file) {
   const sb = getSupabase();
-  if(!sb) return null;
-  const ext = file.name.split('.').pop();
-  const path = `summary_docs/${officeKey}_${Date.now()}.${ext}`;
-  const { data, error } = await sb.storage.from('ums-documents').upload(path, file, { upsert: true });
-  if(error) { console.error('Upload error:', error); return null; }
-  const { data: urlData } = sb.storage.from('ums-documents').getPublicUrl(path);
-  // Also save metadata to Supabase table
-  await sb.from('summary_uploads').upsert({
+  let publicUrl = null;
+
+  // Try Supabase Storage upload
+  if(sb) {
+    try {
+      const ext = file.name.split('.').pop();
+      const path = `summary_docs/${officeKey}_${Date.now()}.${ext}`;
+      const { data, error } = await sb.storage.from('ums-documents').upload(path, file, { upsert: true });
+      if(!error) {
+        const { data: urlData } = sb.storage.from('ums-documents').getPublicUrl(path);
+        publicUrl = urlData.publicUrl;
+        // Try saving to Supabase table — ignore 404 gracefully
+        try {
+          await sb.from('summary_uploads').upsert({
+            office_key: officeKey,
+            file_name: file.name,
+            file_path: path,
+            public_url: publicUrl,
+            uploaded_by: window.currentUser || 'UNKNOWN',
+            uploaded_at: new Date().toISOString()
+          }, { onConflict: 'office_key' });
+        } catch(tableErr) { /* table may not exist — use localStorage fallback */ }
+      }
+    } catch(e) { console.warn('Supabase storage error:', e); }
+  }
+
+  // Always save metadata to localStorage (works even without Supabase table)
+  const meta = {
     office_key: officeKey,
     file_name: file.name,
-    file_path: path,
-    public_url: urlData.publicUrl,
-    uploaded_by: window.currentUser || currentUser || 'UNKNOWN',
-    uploaded_at: new Date().toISOString()
-  }, { onConflict: 'office_key' });
-  return urlData.publicUrl;
+    public_url: publicUrl,
+    uploaded_by: window.currentUser || 'UNKNOWN',
+    uploaded_at: new Date().toISOString(),
+    local_data: null  // will hold base64 if no cloud URL
+  };
+
+  // If no cloud URL, store file as base64 in localStorage
+  if(!publicUrl) {
+    await new Promise(resolve => {
+      const reader = new FileReader();
+      reader.onload = ev => { meta.local_data = ev.target.result; resolve(); };
+      reader.readAsDataURL(file);
+    });
+  }
+
+  const allDocs = JSON.parse(localStorage.getItem('ums_summary_docs') || '{}');
+  allDocs[officeKey] = meta;
+  localStorage.setItem('ums_summary_docs', JSON.stringify(allDocs));
+
+  return publicUrl || 'local:' + officeKey;
 }
 
-// ── Get uploaded doc info from Supabase ──
+// ── Get uploaded doc info — localStorage first, Supabase fallback ──
 async function getUploadedDocCloud(officeKey) {
+  // Check localStorage first (always available)
+  const allDocs = JSON.parse(localStorage.getItem('ums_summary_docs') || '{}');
+  if(allDocs[officeKey]) return allDocs[officeKey];
+
+  // Try Supabase table as fallback
   const sb = getSupabase();
   if(!sb) return null;
-  const { data, error } = await sb.from('summary_uploads').select('*').eq('office_key', officeKey).single();
-  if(error || !data) return null;
-  return data;
+  try {
+    const { data, error } = await sb.from('summary_uploads').select('*').eq('office_key', officeKey).single();
+    if(!error && data) {
+      // Cache in localStorage for next time
+      allDocs[officeKey] = data;
+      localStorage.setItem('ums_summary_docs', JSON.stringify(allDocs));
+      return data;
+    }
+  } catch(e) { /* table may not exist */ }
+  return null;
 }
 
 // ── Save password reset log to Supabase ──
@@ -1240,16 +1286,14 @@ updateClock();
 // ─── KEY TIMER (DPI panel) ───
 let keyTimer;
 window.addEventListener('keydown', e => {
-  if(e.key.toLowerCase()==='a' && !keyTimer) {
+  if(e.key && e.key.toLowerCase()==='a' && !keyTimer) {
     keyTimer = setTimeout(() => {
-      // Only allow DPI login
       if(window.currentUser !== 'DPI') return;
-      // Ask for password via modal
       openDpiPasswordModal();
     }, 2000);
   }
 });
-window.addEventListener('keyup', e => { if(e.key.toLowerCase()==='a'){clearTimeout(keyTimer); keyTimer=null;} });
+window.addEventListener('keyup', e => { if(e.key && e.key.toLowerCase()==='a'){clearTimeout(keyTimer); keyTimer=null;} });
 
 // ─── ALERT ───
 function myAlert(msg) { document.getElementById('alertMsg').textContent = msg; document.getElementById('customAlert').style.display='flex'; }
@@ -3071,7 +3115,7 @@ function showSummary() {
             let uploadBtn = canUpload
               ? `<button onclick="summaryUploadDoc('${itemKey}')" style="background:#2e7d32;color:white;border:none;padding:3px 8px;border-radius:4px;cursor:pointer;font-size:11px;font-weight:bold;">📤 Upload</button><div id='uploadStatus_${itemKey}' style='font-size:10px;margin-top:2px;'></div>`
               : `<span style="color:#bbb;font-size:10px;">🔒 No Access</span>`;
-            // View button: async check from Supabase — show placeholder, update after check
+            // View button: async check from localStorage + Supabase
             const viewBtnId = 'viewBtn_'+itemKey;
             let viewBtn = `<span id="${viewBtnId}" style="color:#aaa;font-size:10px;font-style:italic;">⏳</span>`;
             // Async check after render
@@ -3079,7 +3123,7 @@ function showSummary() {
               const doc = await getUploadedDocCloud(key);
               const el = document.getElementById(btnId);
               if(!el) return;
-              if(doc && doc.public_url){
+              if(doc && (doc.public_url || doc.local_data)){
                 el.outerHTML = `<button onclick="summaryViewDoc('${key}')" style="background:#1565c0;color:white;border:none;padding:3px 8px;border-radius:4px;cursor:pointer;font-size:11px;font-weight:bold;">👁️ View</button>`;
               } else {
                 el.outerHTML = `<span style="color:#aaa;font-size:10px;font-style:italic;">No Document</span>`;
@@ -3121,46 +3165,41 @@ function handleSummaryFileUpload(event, officeKey){
   const file=event.target.files[0]; if(!file) return;
   const statusDiv=document.getElementById('uploadStatus_'+officeKey);
   if(statusDiv){ statusDiv.innerHTML='⏳ Uploading document...'; statusDiv.style.color='#f39c12'; }
-  const reader=new FileReader();
-  reader.onload=async function(ev){
-    // Supabase mein upload karo
+  (async function(){
     const cloudUrl = await summaryUploadDocCloud(officeKey, file);
     if(cloudUrl) {
       if(statusDiv){ statusDiv.innerHTML='✅ Uploaded: '+file.name; statusDiv.style.color='#27ae60'; }
-      myAlert('✅ Document uploaded successfully.\nFile: '+file.name);
+      myAlert('✅ Document uploaded!\nFile: '+file.name+'\n\nSummary दोबारा खोलें — View button दिखेगा।');
     } else {
       if(statusDiv){ statusDiv.innerHTML='❌ Upload failed.'; statusDiv.style.color='#c62828'; }
-      myAlert('❌ Upload failed. Supabase is not connected.');
+      myAlert('❌ Upload failed.');
     }
-  };
-  reader.readAsDataURL(file);
+  })();
   event.target.value='';
 }
 async function summaryViewDoc(officeKey){
+  if(!officeKey){ myAlert('❌ Office key missing.'); return; }
   const docInfo = await getUploadedDocCloud(officeKey);
-  if(!docInfo){ myAlert('❌ No document has been uploaded for ' + officeKey + '.'); return; }
-  try {
-    if(document.getElementById('docViewPopup')) document.getElementById('docViewPopup').remove();
-    const popup=document.createElement('div');
-    popup.id='docViewPopup';
-    popup.style.cssText='position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.7);z-index:99999;display:flex;align-items:center;justify-content:center;';
-    popup.innerHTML=`<div style="background:white;padding:25px;border-radius:10px;max-width:450px;width:90%;box-shadow:0 10px 30px rgba(0,0,0,.4);font-family:sans-serif;">
-      <h3 style="margin:0 0 15px 0;color:#002e5b;border-bottom:2px solid #002e5b;padding-bottom:8px;">📄 Document Viewer</h3>
-      <table style="width:100%;font-size:13px;border-collapse:collapse;">
-        <tr><td style="padding:5px;font-weight:bold;color:#555;width:40%;">Office:</td><td style="padding:5px;">${officeKey}</td></tr>
-        <tr><td style="padding:5px;font-weight:bold;color:#555;">File Name:</td><td style="padding:5px;color:#1565c0;">${docInfo.name||'N/A'}</td></tr>
-        <tr><td style="padding:5px;font-weight:bold;color:#555;">Uploaded By:</td><td style="padding:5px;">${docInfo.uploadedBy||'N/A'}</td></tr>
-        <tr><td style="padding:5px;font-weight:bold;color:#555;">Upload Time:</td><td style="padding:5px;">${docInfo.uploadedAt||'N/A'}</td></tr>
-      </table>
-      <div style="display:flex;gap:10px;margin-top:20px;justify-content:center;">
-        <button onclick="window.open('${docInfo.public_url}','_blank')"
-          style="background:#1565c0;color:white;border:none;padding:10px 20px;border-radius:5px;cursor:pointer;font-weight:bold;font-size:13px;">👁️ View Document</button>
-        <button onclick="document.getElementById('docViewPopup').remove()" style="background:#c62828;color:white;border:none;padding:10px 20px;border-radius:5px;cursor:pointer;font-weight:bold;font-size:13px;">✖ Close</button>
-      </div>
-    </div>`;
-    document.body.appendChild(popup);
-    popup.addEventListener('click', e=>{ if(e.target===popup) popup.remove(); });
-  } catch(e){ myAlert('❌ Unable to read the document. It may be corrupted.'); }
+  if(!docInfo){ myAlert('❌ कोई document upload नहीं है — ' + officeKey); return; }
+
+  // Local base64 file
+  if(docInfo.local_data){
+    try {
+      const win = window.open('','_blank');
+      if(!win){ myAlert('❌ Popup blocked! Browser settings में popup allow करें.'); return; }
+      win.document.write('<html><head><title>'+officeKey+' Document</title></head><body style="margin:0;padding:0;"><iframe src="'+docInfo.local_data+'" style="width:100%;height:100vh;border:none;"></iframe></body></html>');
+      win.document.close();
+    } catch(e){ myAlert('❌ Document open नहीं हो सका.'); }
+    return;
+  }
+
+  // Cloud URL
+  if(docInfo.public_url && !docInfo.public_url.startsWith('local:')){
+    window.open(docInfo.public_url,'_blank');
+    return;
+  }
+
+  myAlert('❌ Document data नहीं मिला — ' + officeKey + '. पहले Upload करें।');
 }
 
 // ─── ANALYTICS (Live Dashboard) ───
