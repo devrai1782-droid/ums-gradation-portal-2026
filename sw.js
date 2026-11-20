@@ -1,6 +1,6 @@
 // UMS Gradation ERP Service Worker
 // Har deploy par CACHE_NAME ka number badlo (v1 -> v2 -> v3) taaki users ko "Update available" banner dikhe.
-const CACHE_NAME = 'ums-gradation-v2';
+const CACHE_NAME = 'ums-gradation-v3';
 
 self.addEventListener('install', function(e) { self.skipWaiting(); });
 self.addEventListener('activate', function(e) { e.waitUntil(clients.claim()); });
